@@ -454,6 +454,32 @@ app.get("/activities", async (req, res) => {
   }
 });
 
+app.get("/locations", async (req, res) => {
+  try {
+    const { keyword } = req.query;
+    if (!keyword || keyword.length < 3) {
+      return res.status(400).json({ error: "keyword must be at least 3 characters" });
+    }
+
+    const token = await getAmadeusToken();
+    const params = new URLSearchParams({ subType: "CITY", keyword, "page[limit]": "5" });
+    const response = await fetch(
+      `https://test.api.amadeus.com/v1/reference-data/locations?${params}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: data.errors?.[0]?.detail || "Amadeus request failed" });
+    }
+
+    res.json({ status: "success", data: data.data });
+  } catch (error) {
+    console.error("Error: ", error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
