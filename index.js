@@ -214,7 +214,7 @@ app.post('/diary-entries', async (req, res) => {
 
     const query = `INSERT INTO diary_entries (trip_id, caption, photo_url) VALUES ($1, $2, $3) RETURNING id, date_created`;
     const params = [data.tripId, data.caption, data.photoUrl];
-    const result = await client.query(query.params);
+    const result = await client.query(query, params);
     data.id = result.rows[0].id;
     data.dateCreated = result.rows[0].date_created;
     console.log(`Data entry created with id ${data.id}`);
@@ -234,7 +234,7 @@ app.get('/diary-entries', async (req, res) => {
     let query = 'SELECT * FROM diary_entries';
     const params = [];
     if (tripId) {
-      query += ` WHERE trip_id = ${tripId}`;
+      query += ` WHERE trip_id = $1`;
       params.push(tripId);
     }
     query += ' ORDER BY date_created DESC';
@@ -271,8 +271,8 @@ app.put('/diary-entries/:id', async (req, res) => {
       caption: req.body.caption,
       photoUrl: req.body.photoUrl
     };
-    const query = `UPDATE diary_entries SET caption = $1, photoUrl = $2 WHERE id = $3 RETURNING *`;
-    const params = [data.tripId, data.caption, data.photoUrl];
+    const query = `UPDATE diary_entries SET caption = $1, photo_url = $2 WHERE id = $3 RETURNING *`;
+    const params = [data.caption, data.photoUrl, req.params.id];
     const result = await client.query(query, params);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Entry not found" });
@@ -421,35 +421,47 @@ app.delete("/todos/:id", async (req, res) => {
   }
 });
 
-const { getAmadeusToken } = require("./amadeusClient");
-
 app.get("/activities", async (req, res) => {
   try {
-    const { latitude, longitude, radius } = req.query;
+    const { latitude, longitude } = req.query;
     if (!latitude || !longitude) {
       return res.status(400).json({ error: "latitude and longitude are required" });
     }
 
-    const token = await getAmadeusToken();
-    const params = new URLSearchParams({
-      latitude,
-      longitude,
-      radius: radius || "5", // km, max 20
+    // Overpass QL: Find tourist attractions, museums, and parks within 5000 meters
+    const query = `
+      [out:json][timeout:25];
+      (
+        node["tourism"~"attraction|museum|viewpoint"](around:5000,${latitude},${longitude});
+        way["tourism"~"attraction|museum|viewpoint"](around:5000,${latitude},${longitude});
+        node["amenity"~"arts_centre|theatre"](around:5000,${latitude},${longitude});
+      );
+      out body;
+      >;
+      out skel qt;
+    `;
+
+    const response = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      body: `data=${encodeURIComponent(query)}`,
     });
 
-    const response = await fetch(
-      `https://test.api.amadeus.com/v1/shopping/activities?${params}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    const data = await response.json();
+    const result = await response.json();
 
-    if (!response.ok) {
-      return res.status(response.status).json({ error: data.errors?.[0]?.detail || "Amadeus request failed" });
-    }
+    // Format Overpass results to match our frontend needs
+    const formattedActivities = result.elements
+      .filter(el => el.tags && el.tags.name)
+      .map(el => ({
+        id: el.id,
+        name: el.tags.name,
+        category: el.tags.tourism || el.tags.amenity || "Activity",
+        website: el.tags.website || null,
+        // Free API doesn't provide photos, we'll handle this in frontend
+      }));
 
-    res.json({ status: "success", data: data.data });
+    res.json({ status: "success", data: formattedActivities });
   } catch (error) {
-    console.error("Error: ", error.message);
+    console.error("Activity Error: ", error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -461,21 +473,25 @@ app.get("/locations", async (req, res) => {
       return res.status(400).json({ error: "keyword must be at least 3 characters" });
     }
 
-    const token = await getAmadeusToken();
-    const params = new URLSearchParams({ subType: "CITY", keyword, "page[limit]": "5" });
+    // Nominatim requires a User-Agent header
     const response = await fetch(
-      `https://test.api.amadeus.com/v1/reference-data/locations?${params}`,
-      { headers: { Authorization: `Bearer ${token}` } }
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(keyword)}&format=json&limit=5`,
+      { headers: { "User-Agent": "TravelApp/1.0" } }
     );
     const data = await response.json();
 
-    if (!response.ok) {
-      return res.status(response.status).json({ error: data.errors?.[0]?.detail || "Amadeus request failed" });
-    }
+    // Map Nominatim data to a similar format as before
+    const formattedData = data.map(item => ({
+      name: item.display_name,
+      geoCode: {
+        latitude: item.lat,
+        longitude: item.lon
+      }
+    }));
 
-    res.json({ status: "success", data: data.data });
+    res.json({ status: "success", data: formattedData });
   } catch (error) {
-    console.error("Error: ", error.message);
+    console.error("Location Error: ", error.message);
     res.status(500).json({ error: error.message });
   }
 });
