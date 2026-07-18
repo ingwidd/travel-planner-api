@@ -30,43 +30,27 @@ async function getPostgresVersion() {
 
 getPostgresVersion();
 
-app.post('/signup', async (req, res) => {
+app.post('/sync-user', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { email, password } = req.body;
-    const hashedPassword = await bcrypt.hash(password, 12);
-    
-    const userResult = await client.query('SELECT * FROM travel_users WHERE email = $1', [email]);
+    const { uid, email } = req.body;
 
-    if (userResult.rows.length > 0) {
-      return res.status(400).json({ message: 'User already exists' });
+    if (!uid) return res.status(400).json({ error: "UID is missing" });
+
+    // Check if user exists
+    const userCheck = await client.query('SELECT * FROM travel_users WHERE id = $1', [uid]);
+
+    if (userCheck.rows.length === 0) {
+      // If user doesn't exist in Postgres, create them using the Firebase UID
+      const username = email.split('@')[0];
+      await client.query(
+        'INSERT INTO travel_users (id, email, username) VALUES ($1, $2, $3)',
+        [uid, email, username]
+      );
+      console.log(`New user created in Postgres: ${uid}`);
     }
 
-    await client.query('INSERT INTO travel_users (email, password, username) VALUES ($1, $2, $3)', [email, hashedPassword, username]);
-    res.status(201).json({ message: 'User created successfully' });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
-  } 
-});
-
-app.post('/login', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const result = await client.query('SELECT * FROM travel_users WHERE email = $1', [req.body.email]);
-    const user = result.rows[0];
-
-    if (!user) {
-      return res.status(401).json({ message: 'Invalid email or password' });
-    }
-
-    const isPasswordValid = await bcrypt.compare(req.body.password, user.password);
-    if (!isPasswordValid) return res.status(401).json({ auth: false, token: null });
-
-    var token = jwt.sign({ id: user.id, username: user.username, roles: user.roles }, SECRET_KEY, { expiresIn: 86400 });
-    res.json({ auth: true, token: token });
+    res.status(200).json({ message: "User synced successfully" });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
@@ -79,28 +63,22 @@ app.post('/login', async (req, res) => {
 app.post('/trips', async (req, res) => {
   const client = await pool.connect();
   try {
-    const data = {
-      userId: req.body.userId,
-      name: req.body.name,
-      destination: req.body.destination,
-      startDate: req.body.startDate,
-      endDate: req.body.endDate
-    };
+    const { userId, name, destination, startDate, endDate } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" });
+    }
 
     const query = `INSERT INTO trips (user_id, name, destination, start_date, end_date) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
-    const params = [data.userId, data.name, data.destination, data.startDate, data.endDate];
+    const params = [userId, name, destination, startDate, endDate]; 
     const result = await client.query(query, params);
-    data.id = result.rows[0].id;
-    console.log(`Trip created with id ${data.id}`);
-    res.json({ status: "success", data: "data", message: "Trip created successfully" });
+
+    res.json({ status: "success", data: result.rows[0], message: "Trip created successfully" });
   } catch (error) {
-    if (error.code === "23503") {
-      return res.status(400).json({ error: "That user doesn't exist" });
-    }
     if (error.code === "23514") {
       return res.status(400).json({ error: "End date must be on or after start date" });
     }
-    console.error("Error: ", error.message);
+    console.error("Backend Error: ", error.message);
     res.status(500).json({ error: error.message });
   } finally {
     client.release();
@@ -206,19 +184,13 @@ app.delete("/trips/:id", async (req, res) => {
 app.post('/diary-entries', async (req, res) => {
   const client = await pool.connect();
   try {
-    const data = {
-      tripId: req.body.tripId,
-      caption: req.body.caption,
-      photoUrl: req.body.photoUrl
-    };
+    const { tripId, caption, photoUrl } = req.body;
 
     const query = `INSERT INTO diary_entries (trip_id, caption, photo_url) VALUES ($1, $2, $3) RETURNING id, date_created`;
-    const params = [data.tripId, data.caption, data.photoUrl];
+    const params = [tripId, caption, photoUrl];
     const result = await client.query(query, params);
-    data.id = result.rows[0].id;
-    data.dateCreated = result.rows[0].date_created;
-    console.log(`Data entry created with id ${data.id}`);
-    res.json({ status: "success", data: data, message: "Diary entry created successfully", });
+    
+    res.json({ status: "success", data: result.rows[0], message: "Diary entry created successfully", });
   } catch (error) {
     console.error("Error: ", error.message);
     res.status(500).json({ error: error.message });
@@ -230,35 +202,64 @@ app.post('/diary-entries', async (req, res) => {
 app.get('/diary-entries', async (req, res) => {
   const client = await pool.connect();
   try {
-    const tripId = req.query.tripId;
-    let query = 'SELECT * FROM diary_entries';
+    const { tripId, userId } = req.query; // Get both from query
+    let query = `
+      SELECT de.*, t.name as trip_name 
+      FROM diary_entries de 
+      JOIN trips t ON de.trip_id = t.id
+    `;
     const params = [];
+
     if (tripId) {
-      query += ` WHERE trip_id = $1`;
+      query += " WHERE de.trip_id = $1";
       params.push(tripId);
+    } else if (userId) {
+      // General view: show everything for this user
+      query += " WHERE t.user_id = $1";
+      params.push(userId);
     }
-    query += ' ORDER BY date_created DESC';
+
+    query += " ORDER BY de.date_created DESC";
+    const result = await client.query(query, params);
+    res.json({ status: "success", data: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// index.js
+
+app.get('/diary-entries', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { tripId, userId } = req.query; // Get both from query
+    let query = '';
+    let params = [];
+
+    if (tripId && tripId !== 'null') {
+      // 1. Fetch for a specific trip
+      query = 'SELECT * FROM diary_entries WHERE trip_id = $1 ORDER BY date_created DESC';
+      params = [tripId];
+    } else if (userId) {
+      // 2. "General View": Join with trips table to get all entries for this user
+      query = `
+        SELECT de.* FROM diary_entries de
+        JOIN trips t ON de.trip_id = t.id
+        WHERE t.user_id = $1
+        ORDER BY de.date_created DESC
+      `;
+      params = [userId];
+    } else {
+      return res.status(400).json({ error: "Missing tripId or userId" });
+    }
+
     const result = await client.query(query, params);
     res.json({ status: "success", data: result.rows });
   } catch (error) {
     console.error('Error: ', error.message);
     res.status(500).json({ error: error.message });
-  } finally { 
-    client.release();
-  }
-});
-
-app.get('/diary-entries/:id', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const query = 'SELECT * FROM diary_entries WHERE id = $1';
-    const result = await client.query(query, [req.params.id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Entry not found" });
-    }
-    res.json({ status: "success", data: result.rows[0] });
-  } catch (error) {
-    console.error("Error: ", error.message); 
   } finally {
     client.release();
   }
@@ -321,9 +322,8 @@ app.post('/todos', async (req, res) => {
     const query = `INSERT INTO todos (trip_id, task_description, is_completed) VALUES ($1, $2, $3) RETURNING id`;
     const params = [data.tripId, data.task_description, data.is_completed];
     const result = await client.query(query, params);
-    data.id = result.rows[0].id;
-    console.log(`To do created with id ${data.id}`);
-    res.json({ status: "success", data: data, message: "Todo created successfully"});
+    
+    res.json({ status: "success", data: result.rows[0], message: "Todo created successfully" });
   } catch (error) {
     if (error.code === "23503") {
       return res.status(400).json({ error: "That trip doesn't exist" });
@@ -432,21 +432,33 @@ app.get("/activities", async (req, res) => {
     const query = `
       [out:json][timeout:25];
       (
-        node["tourism"~"attraction|museum|viewpoint"](around:5000,${latitude},${longitude});
-        way["tourism"~"attraction|museum|viewpoint"](around:5000,${latitude},${longitude});
+        node["tourism"~"attraction|museum|viewpoint|zoo|theme_park"](around:5000,${latitude},${longitude});
         node["amenity"~"arts_centre|theatre"](around:5000,${latitude},${longitude});
       );
       out body;
-      >;
-      out skel qt;
     `;
 
     const response = await fetch("https://overpass-api.de/api/interpreter", {
       method: "POST",
-      body: `data=${encodeURIComponent(query)}`,
+      headers: {
+        // IMPORTANT: Overpass often rejects requests without a User-Agent
+        "User-Agent": "MyTravelApp/1.0",
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({ data: query }),
     });
 
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("Overpass API Error Response:", text);
+      return res.status(response.status).json({ error: "Failed to fetch data from Overpass" });
+    }
+
     const result = await response.json();
+
+    if (!result.elements) {
+      return res.json({ status: "success", data: [] });
+    }
 
     // Format Overpass results to match our frontend needs
     const formattedActivities = result.elements
@@ -455,13 +467,13 @@ app.get("/activities", async (req, res) => {
         id: el.id,
         name: el.tags.name,
         category: el.tags.tourism || el.tags.amenity || "Activity",
-        website: el.tags.website || null,
+        website: el.tags.website || el.tags["contact:website"] || null,
         // Free API doesn't provide photos, we'll handle this in frontend
       }));
 
     res.json({ status: "success", data: formattedActivities });
   } catch (error) {
-    console.error("Activity Error: ", error.message);
+    console.error("Internal Server Error in /activities ", error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -497,9 +509,9 @@ app.get("/locations", async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 app.listen(3000, () => {
-    console.log('App is listenig on port 3000');
+  console.log('App is listenig on port 3000');
 });
