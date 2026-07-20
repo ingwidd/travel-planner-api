@@ -70,7 +70,7 @@ app.post('/trips', async (req, res) => {
     }
 
     const query = `INSERT INTO trips (user_id, name, destination, start_date, end_date) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
-    const params = [userId, name, destination, startDate, endDate]; 
+    const params = [userId, name, destination, startDate, endDate];
     const result = await client.query(query, params);
 
     res.json({ status: "success", data: result.rows[0], message: "Trip created successfully" });
@@ -189,7 +189,7 @@ app.post('/diary-entries', async (req, res) => {
     const query = `INSERT INTO diary_entries (trip_id, caption, photo_url) VALUES ($1, $2, $3) RETURNING id, date_created`;
     const params = [tripId, caption, photoUrl];
     const result = await client.query(query, params);
-    
+
     res.json({ status: "success", data: result.rows[0], message: "Diary entry created successfully", });
   } catch (error) {
     console.error("Error: ", error.message);
@@ -322,7 +322,7 @@ app.post('/todos', async (req, res) => {
     const query = `INSERT INTO todos (trip_id, task_description, is_completed) VALUES ($1, $2, $3) RETURNING id`;
     const params = [data.tripId, data.task_description, data.is_completed];
     const result = await client.query(query, params);
-    
+
     res.json({ status: "success", data: result.rows[0], message: "Todo created successfully" });
   } catch (error) {
     if (error.code === "23503") {
@@ -338,14 +338,25 @@ app.post('/todos', async (req, res) => {
 app.get('/todos', async (req, res) => {
   const client = await pool.connect();
   try {
-    const tripId = req.query.tripId;
-    let query = "SELECT * FROM todos";
-    const params = [];
-    if (tripId) {
-      query += " WHERE trip_id = $1";
+    const { tripId, userId } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" });
+    }
+
+    let query = `
+      SELECT t.* FROM todos t
+      JOIN trips tr ON t.trip_id = tr.id
+      WHERE tr.user_id = $1
+    `;
+    const params = [userId];
+
+    if (tripId && tripId !== 'null') {
+      query += " AND t.trip_id = $2";
       params.push(tripId);
     }
-    query += " ORDER BY is_completed, id";
+
+    query += " ORDER BY t.is_completed, t.id";
     const result = await client.query(query, params);
     res.json({ status: "success", data: result.rows });
   } catch (error) {
