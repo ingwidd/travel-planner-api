@@ -439,55 +439,78 @@ app.get("/activities", async (req, res) => {
       return res.status(400).json({ error: "latitude and longitude are required" });
     }
 
-    // Overpass QL: Find tourist attractions, museums, and parks within 5000 meters
+    // List of multiple Overpass API mirrors to try if one is busy
+    const overpassInstances = [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://lz4.overpass-api.de/api/interpreter",
+      "https://z.overpass-api.de/api/interpreter"
+    ];
+
+    // Optimized Query: Searching for nodes within 5km
+    // We removed the complex regex "~" where possible to make it faster
     const query = `
       [out:json][timeout:25];
       (
-        node["tourism"~"attraction|museum|viewpoint|zoo|theme_park"](around:5000,${latitude},${longitude});
+        node["tourism"~"attraction|museum|viewpoint"](around:5000,${latitude},${longitude});
         node["amenity"~"arts_centre|theatre"](around:5000,${latitude},${longitude});
       );
-      out body;
+      out body 15;
     `;
 
-    const response = await fetch("https://overpass-api.de/api/interpreter", {
-      method: "POST",
-      headers: {
-        // IMPORTANT: Overpass often rejects requests without a User-Agent
-        "User-Agent": "MyTravelApp/1.0",
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: new URLSearchParams({ data: query }),
+    let lastError = null;
+
+    // Loop through instances until one works
+    for (const instance of overpassInstances) {
+      try {
+        console.log(`Trying Overpass instance: ${instance}`);
+        const response = await fetch(instance, {
+          method: "POST",
+          headers: {
+            "User-Agent": "TravelPlannerApp/1.0",
+            "Content-Type": "application/x-www-form-urlencoded"
+          },
+          body: new URLSearchParams({ data: query }),
+        });
+
+        if (response.ok) {
+          const result = await response.json();
+          const formattedActivities = (result.elements || [])
+            .filter(el => el.tags && el.tags.name)
+            .map(el => ({
+              id: el.id,
+              name: el.tags.name,
+              category: el.tags.tourism || el.tags.amenity || "Activity",
+              website: el.tags.website || el.tags["contact:website"] || null,
+            }));
+
+          console.log(`Success using ${instance}`);
+          return res.json({ status: "success", data: formattedActivities });
+        } else {
+          const errorText = await response.text();
+          console.warn(`Instance ${instance} failed: ${response.status}`);
+        }
+      } catch (err) {
+        lastError = err;
+        console.error(`Connection error for ${instance}:`, err.message);
+      }
+    }
+
+    // If all instances fail
+    res.status(503).json({
+      error: "All map servers are currently busy. Please try again in a few seconds.",
+      details: lastError?.message
     });
 
-    if (!response.ok) {
-      const text = await response.text();
-      console.error("Overpass API Error Response:", text);
-      return res.status(response.status).json({ error: "Failed to fetch data from Overpass" });
-    }
-
-    const result = await response.json();
-
-    if (!result.elements) {
-      return res.json({ status: "success", data: [] });
-    }
-
-    // Format Overpass results to match our frontend needs
-    const formattedActivities = result.elements
-      .filter(el => el.tags && el.tags.name)
-      .map(el => ({
-        id: el.id,
-        name: el.tags.name,
-        category: el.tags.tourism || el.tags.amenity || "Activity",
-        website: el.tags.website || el.tags["contact:website"] || null,
-        // Free API doesn't provide photos, we'll handle this in frontend
-      }));
-
-    res.json({ status: "success", data: formattedActivities });
   } catch (error) {
     console.error("Internal Server Error in /activities ", error.message);
     res.status(500).json({ error: error.message });
   }
 });
+
+// index.js
+
+// index.js
 
 app.get("/locations", async (req, res) => {
   try {
@@ -496,26 +519,43 @@ app.get("/locations", async (req, res) => {
       return res.status(400).json({ error: "keyword must be at least 3 characters" });
     }
 
-    // Nominatim requires a User-Agent header
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(keyword)}&format=json&limit=5`,
-      { headers: { "User-Agent": "TravelApp/1.0" } }
-    );
+    // Using Photon API (Mirror of OpenStreetMap data)
+    // No API key required, much more reliable for development
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(keyword)}&limit=5`;
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`Location provider returned status ${response.status}`);
+    }
+
     const data = await response.json();
 
-    // Map Nominatim data to a similar format as before
-    const formattedData = data.map(item => ({
-      name: item.display_name,
-      geoCode: {
-        latitude: item.lat,
-        longitude: item.lon
-      }
-    }));
+    // Photon returns GeoJSON format: data.features
+    const formattedData = data.features.map(item => {
+      const { name, city, state, country } = item.properties;
+      
+      // Create a nice display name: "Paris, France" or "Eiffel Tower, Paris, France"
+      const displayName = [name, city, state, country]
+        .filter(Boolean) // Remove null/undefined
+        .filter((val, index, self) => self.indexOf(val) === index) // Remove duplicates
+        .join(", ");
+
+      return {
+        name: displayName,
+        geoCode: {
+          // IMPORTANT: Photon returns [longitude, latitude]
+          // We must flip them to match your frontend [latitude, longitude]
+          latitude: item.geometry.coordinates[1],
+          longitude: item.geometry.coordinates[0]
+        }
+      };
+    });
 
     res.json({ status: "success", data: formattedData });
   } catch (error) {
-    console.error("Location Error: ", error.message);
-    res.status(500).json({ error: error.message });
+    console.error("Location Search Error:", error.message);
+    res.status(500).json({ error: "Could not find locations. Please try again." });
   }
 });
 
