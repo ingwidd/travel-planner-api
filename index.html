@@ -1,31 +1,109 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="en">
   <head>
-    <title>API Documentation</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Travel Planner Pro API Documentation</title>
     <style>
       body {
-        font-family: Arial, sans-serif;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        line-height: 1.6;
+        color: #333;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f4f7f6;
       }
+      h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+      h2 { color: #2980b9; margin-top: 30px; border-left: 5px solid #3498db; padding-left: 10px; }
+      .endpoint { background: #fff; padding: 15px; margin-bottom: 10px; border-radius: 8px; shadow: 0 2px 5px rgba(0,0,0,0.1); border: 1px solid #ddd; }
+      code { background: #eee; padding: 2px 5px; border-radius: 4px; font-family: monospace; font-weight: bold; color: #d63384; }
+      .method { font-weight: bold; color: #fff; padding: 3px 8px; border-radius: 4px; display: inline-block; min-width: 60px; text-align: center; margin-right: 10px; }
+      .get { background: #61afe4; }
+      .post { background: #49cc90; }
+      .put { background: #fca130; }
+      .delete { background: #f93e3e; }
+      ul { list-style: none; padding: 0; }
+      li { margin-bottom: 10px; }
+      .params { font-size: 0.9em; color: #666; margin-top: 5px; font-style: italic; }
     </style>
   </head>
   <body>
-    <h1>Welcome to the Pilate's Studio API!</h1>
+    <h1>Travel Planner Pro API</h1>
+    <p>Welcome to the backend API. Below are the available endpoints and their usage.</p>
 
-    <h2>How to utilise this API:</h2>
-    <ul>
-      <li>
-        <strong>POST /signup :</strong> Register a new user. The payload should
-        be a JSON object containing 'username' and 'password' keys.
-      </li>
-      <li>
-        <strong>POST /login :</strong> Authenticate an existing user. The
-        payload should be a JSON object with 'username' and 'password' keys.
-        This endpoint returns a JWT token when successful.
-      </li>
-      <li>
-        <strong>GET /logout :</strong> Invalidate a user's JWT token. This
-        endpoint does not require a payload.
-      </li>
-    </ul>
+    <!-- User Sync -->
+    <h2>Authentication & Users</h2>
+    <div class="endpoint">
+      <span class="method post">POST</span> <code>/sync-user</code>
+      <div class="params">Payload: { "uid": "string", "email": "string" }</div>
+      <p>Syncs Firebase authenticated users with the local Postgres database.</p>
+    </div>
+
+    <!-- Trips -->
+    <h2>Trips</h2>
+    <div class="endpoint">
+      <span class="method get">GET</span> <code>/trips?userId=xxx</code>
+      <p>Fetch all trips for a specific user.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method post">POST</span> <code>/trips</code>
+      <div class="params">Payload: { "userId", "name", "destination", "startDate", "endDate" }</div>
+      <p>Create a new trip itinerary.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method put">PUT</span> <code>/trips/:id</code>
+      <p>Update trip details by ID.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method delete">DELETE</span> <code>/trips/:id</code>
+      <p>Remove a trip from the database.</p>
+    </div>
+
+    <!-- Diary -->
+    <h2>Diary Entries</h2>
+    <div class="endpoint">
+      <span class="method get">GET</span> <code>/diary-entries?userId=xxx</code> OR <code>?tripId=xxx</code>
+      <p>Fetch diary entries filtered by user or a specific trip.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method post">POST</span> <code>/diary-entries</code>
+      <div class="params">Payload: { "tripId", "caption", "photoUrl" }</div>
+      <p>Create a new photo diary entry.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method put">PUT</span> <code>/diary-entries/:id</code>
+      <p>Update caption or photo of an entry.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method delete">DELETE</span> <code>/diary-entries/:id</code>
+      <p>Delete a diary entry.</p>
+    </div>
+
+    <!-- To-Dos -->
+    <h2>To-Do List</h2>
+    <div class="endpoint">
+      <span class="method get">GET</span> <code>/todos?userId=xxx&tripId=xxx</code>
+      <p>Fetch tasks. <code>userId</code> is required; <code>tripId</code> is optional.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method post">POST</span> <code>/todos</code>
+      <div class="params">Payload: { "tripId", "task_description", "is_completed" }</div>
+      <p>Add a new task to a trip.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method put">PUT</span> <code>/todos/:id</code>
+      <p>Mark task as complete or update description.</p>
+    </div>
+
+    <h2>Travel Tools (External Data)</h2>
+    <div class="endpoint">
+      <span class="method get">GET</span> <code>/locations?keyword=paris</code>
+      <p>Search for city coordinates using the Photon (OSM) API.</p>
+    </div>
+    <div class="endpoint">
+      <span class="method get">GET</span> <code>/activities?latitude=xxx&longitude=xxx</code>
+      <p>Find nearby attractions and museums using Overpass API mirrors.</p>
+    </div>
   </body>
 </html>
