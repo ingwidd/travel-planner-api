@@ -5,6 +5,10 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const { randomUUID } = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
+const { applicationDefault, cert, getApp, getApps, initializeApp } = require("firebase-admin/app");
+const { getAuth: getFirebaseAdminAuth } = require("firebase-admin/auth");
 const { DATABASE_URL, SECRET_KEY } = process.env;
 
 let app = express();
@@ -20,6 +24,102 @@ const pool = new Pool({
     rejectUnauthorized: false,
   },
 });
+
+const allowedDiaryImageTypes = new Map([
+  ["image/avif", "avif"],
+  ["image/gif", "gif"],
+  ["image/jpeg", "jpg"],
+  ["image/png", "png"],
+  ["image/webp", "webp"],
+]);
+
+let firebaseAdminAuth;
+let supabaseClient;
+
+function getAdminAuth() {
+  if (!firebaseAdminAuth) {
+    let credential;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      try {
+        credential = cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
+      } catch (error) {
+        throw new Error(`FIREBASE_SERVICE_ACCOUNT must contain valid service-account JSON: ${error.message}`);
+      }
+    } else {
+      credential = applicationDefault();
+    }
+
+    const app = getApps().length ? getApp() : initializeApp({ credential });
+    firebaseAdminAuth = getFirebaseAdminAuth(app);
+  }
+  return firebaseAdminAuth;
+}
+
+function getDiaryImageBucket() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured on the API server");
+  }
+  if (!supabaseClient) {
+    supabaseClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  }
+  return supabaseClient.storage.from(process.env.SUPABASE_DIARY_BUCKET || "diary-images");
+}
+
+function isOwnedDiaryImagePath(userId, objectPath) {
+  if (typeof objectPath !== "string") return false;
+  const [ownerId, fileName, ...extraSegments] = objectPath.split("/");
+  return ownerId === userId
+    && extraSegments.length === 0
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(avif|gif|jpg|png|webp)$/i.test(fileName);
+}
+
+async function requireFirebaseUser(req, res, next) {
+  const authorization = req.get("authorization") || "";
+  const token = authorization.match(/^Bearer (.+)$/i)?.[1];
+  if (!token) {
+    return res.status(401).json({ error: "A Firebase sign-in token is required" });
+  }
+
+  let adminAuth;
+  try {
+    adminAuth = getAdminAuth();
+  } catch (error) {
+    console.error("Firebase Admin configuration failed:", error.message);
+    return res.status(500).json({ error: "Firebase Admin authentication is not configured on the API server" });
+  }
+
+  try {
+    req.auth = await adminAuth.verifyIdToken(token);
+    return next();
+  } catch (error) {
+    console.error("Firebase token verification failed:", error.message);
+    res.status(401).json({ error: "Your session is invalid or expired. Please sign in again." });
+  }
+}
+
+async function removeDiaryImage(userId, objectPath) {
+  if (!isOwnedDiaryImagePath(userId, objectPath)) {
+    return;
+  }
+  const { error } = await getDiaryImageBucket().remove([objectPath]);
+  if (error) throw new Error(`Supabase image cleanup failed: ${error.message}`);
+}
+
+async function getDiaryImageUrl(photoPath, userId) {
+  if (!photoPath || /^https?:\/\//i.test(photoPath)) {
+    return photoPath;
+  }
+  if (!isOwnedDiaryImagePath(userId, photoPath)) {
+    throw new Error("Diary image path is invalid or does not belong to this user");
+  }
+  const { data, error } = await getDiaryImageBucket().createSignedUrl(photoPath, 60 * 60);
+  if (error) throw new Error(`Supabase signed URL creation failed: ${error.message}`);
+  return data.signedUrl;
+}
+
+async function withSignedDiaryImage(entry, userId) {
+  return { ...entry, photo_url: await getDiaryImageUrl(entry.photo_url, userId) };
+}
 
 async function getPostgresVersion() {
   const client = await pool.connect();
@@ -184,131 +284,160 @@ app.delete("/trips/:id", async (req, res) => {
 });
 
 // Diary Entry
-app.post('/diary-entries', async (req, res) => {
-  const client = await pool.connect();
+app.post('/diary-image-uploads', requireFirebaseUser, async (req, res) => {
+  const { tripId, contentType } = req.body;
+  const extension = allowedDiaryImageTypes.get(contentType);
+  if (!tripId || !extension) {
+    return res.status(400).json({ error: "A trip and supported image type are required" });
+  }
+
   try {
-    const { tripId, caption, photoUrl } = req.body;
+    const trip = await pool.query(
+      "SELECT id FROM trips WHERE id = $1 AND user_id = $2",
+      [tripId, req.auth.uid]
+    );
+    if (!trip.rows.length) {
+      return res.status(404).json({ error: "Trip not found" });
+    }
 
-    const query = `INSERT INTO diary_entries (trip_id, caption, photo_url) VALUES ($1, $2, $3) RETURNING id, date_created`;
-    const params = [tripId, caption, photoUrl];
-    const result = await client.query(query, params);
-
-    res.json({ status: "success", data: result.rows[0], message: "Diary entry created successfully", });
+    const photoPath = `${req.auth.uid}/${randomUUID()}.${extension}`;
+    const { data, error } = await getDiaryImageBucket().createSignedUploadUrl(photoPath, { upsert: false });
+    if (error) throw new Error(`Supabase upload authorization failed: ${error.message}`);
+    res.json({
+      status: "success",
+      data: { path: data.path, token: data.token },
+    });
   } catch (error) {
-    console.error("Error: ", error.message);
+    console.error("Diary image upload authorization failed:", error.message);
     res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
   }
 });
 
-app.get('/diary-entries', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { tripId, userId } = req.query; // Get both from query
-    let query = `
-      SELECT de.*, t.name as trip_name 
-      FROM diary_entries de 
-      JOIN trips t ON de.trip_id = t.id
-    `;
-    const params = [];
+app.post('/diary-entries', requireFirebaseUser, async (req, res) => {
+  const { tripId, caption, photoPath } = req.body;
+  if (!tripId || !caption || !isOwnedDiaryImagePath(req.auth.uid, photoPath)) {
+    return res.status(400).json({ error: "Trip, caption, and an owned image are required" });
+  }
 
-    if (tripId) {
-      query += " WHERE de.trip_id = $1";
-      params.push(tripId);
-    } else if (userId) {
-      // General view: show everything for this user
-      query += " WHERE t.user_id = $1";
-      params.push(userId);
+  try {
+    const trip = await pool.query(
+      "SELECT id FROM trips WHERE id = $1 AND user_id = $2",
+      [tripId, req.auth.uid]
+    );
+    if (!trip.rows.length) {
+      return res.status(404).json({ error: "Trip not found" });
+    }
+
+    const photoUrl = await getDiaryImageUrl(photoPath, req.auth.uid);
+    const result = await pool.query(
+      `INSERT INTO diary_entries (trip_id, caption, photo_url)
+       VALUES ($1, $2, $3)
+       RETURNING id, trip_id, caption, photo_url, date_created`,
+      [tripId, caption, photoPath]
+    );
+    const data = { ...result.rows[0], photo_url: photoUrl };
+    res.json({ status: "success", data, message: "Diary entry created successfully" });
+  } catch (error) {
+    console.error("Diary entry creation failed:", error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/diary-entries', requireFirebaseUser, async (req, res) => {
+  try {
+    const params = [req.auth.uid];
+    let query = `
+      SELECT de.*, t.name AS trip_name
+      FROM diary_entries de
+      JOIN trips t ON de.trip_id = t.id
+      WHERE t.user_id = $1
+    `;
+
+    if (req.query.tripId && req.query.tripId !== "null") {
+      query += " AND de.trip_id = $2";
+      params.push(req.query.tripId);
     }
 
     query += " ORDER BY de.date_created DESC";
-    const result = await client.query(query, params);
-    res.json({ status: "success", data: result.rows });
+    const result = await pool.query(query, params);
+    const data = await Promise.all(result.rows.map((entry) => withSignedDiaryImage(entry, req.auth.uid)));
+    res.json({ status: "success", data });
   } catch (error) {
+    console.error("Diary entries fetch failed:", error.message);
     res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
   }
 });
 
-// index.js
-
-app.get('/diary-entries', async (req, res) => {
-  const client = await pool.connect();
+app.put('/diary-entries/:id', requireFirebaseUser, async (req, res) => {
   try {
-    const { tripId, userId } = req.query; // Get both from query
-    let query = '';
-    let params = [];
-
-    if (tripId && tripId !== 'null') {
-      // 1. Fetch for a specific trip
-      query = 'SELECT * FROM diary_entries WHERE trip_id = $1 ORDER BY date_created DESC';
-      params = [tripId];
-    } else if (userId) {
-      // 2. "General View": Join with trips table to get all entries for this user
-      query = `
-        SELECT de.* FROM diary_entries de
-        JOIN trips t ON de.trip_id = t.id
-        WHERE t.user_id = $1
-        ORDER BY de.date_created DESC
-      `;
-      params = [userId];
-    } else {
-      return res.status(400).json({ error: "Missing tripId or userId" });
+    const existing = await pool.query(
+      `SELECT de.*
+       FROM diary_entries de
+       JOIN trips t ON de.trip_id = t.id
+       WHERE de.id = $1 AND t.user_id = $2`,
+      [req.params.id, req.auth.uid]
+    );
+    if (!existing.rows.length) {
+      return res.status(404).json({ error: "Diary entry not found" });
+    }
+    if (!req.body.caption) {
+      return res.status(400).json({ error: "A caption is required" });
     }
 
-    const result = await client.query(query, params);
-    res.json({ status: "success", data: result.rows });
+    const oldPhotoPath = existing.rows[0].photo_url;
+    const newPhotoPath = req.body.photoPath || oldPhotoPath;
+    if (!newPhotoPath
+      || (newPhotoPath !== oldPhotoPath && !isOwnedDiaryImagePath(req.auth.uid, newPhotoPath))) {
+      return res.status(400).json({ error: "The image does not belong to this user" });
+    }
+    const photoUrl = await getDiaryImageUrl(newPhotoPath, req.auth.uid);
+    const result = await pool.query(
+      `UPDATE diary_entries
+       SET caption = $1, photo_url = $2
+       WHERE id = $3
+       RETURNING *`,
+      [req.body.caption, newPhotoPath, req.params.id]
+    );
+    const data = { ...result.rows[0], photo_url: photoUrl };
+
+    if (oldPhotoPath !== newPhotoPath) {
+      try {
+        await removeDiaryImage(req.auth.uid, oldPhotoPath);
+      } catch (cleanupError) {
+        console.error(cleanupError.message);
+      }
+    }
+    res.json({ status: "success", data, message: "Diary entry updated successfully" });
   } catch (error) {
-    console.error('Error: ', error.message);
+    console.error("Diary entry update failed:", error.message);
     res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
   }
 });
 
-app.put('/diary-entries/:id', async (req, res) => {
-  const client = await pool.connect();
+app.delete("/diary-entries/:id", requireFirebaseUser, async (req, res) => {
   try {
-    const data = {
-      caption: req.body.caption,
-      photoUrl: req.body.photoUrl
-    };
-    const query = `UPDATE diary_entries SET caption = $1, photo_url = $2 WHERE id = $3 RETURNING *`;
-    const params = [data.caption, data.photoUrl, req.params.id];
-    const result = await client.query(query, params);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Entry not found" });
+    const result = await pool.query(
+      `DELETE FROM diary_entries de
+       USING trips t
+       WHERE de.trip_id = t.id AND de.id = $1 AND t.user_id = $2
+       RETURNING de.photo_url`,
+      [req.params.id, req.auth.uid]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Diary entry not found" });
     }
-    console.log(`Diary entry ${req.params.id} updated successfuly`);
-    res.json({ status: "success", data: result.rows[0], message: "Diary entry updated successfully" });
-  } catch (error) {
-    console.error("Error: ", error.message);
-    res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
-  }
-});
 
-app.delete("/diary-entries/:id", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const query = "DELETE FROM diary_entries WHERE id = $1 RETURNING id";
-    const result = await client.query(query, [req.params.id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Trip not found" });
+    let warning;
+    try {
+      await removeDiaryImage(req.auth.uid, result.rows[0].photo_url);
+    } catch (error) {
+      console.error(error.message);
+      warning = "The entry was deleted, but its stored image could not be removed";
     }
-    console.log(`Diary entry ${req.params.id} deleted successfully`);
-    res.json({
-      status: "success",
-      message: "Diary entry deleted successfully",
-    });
+    res.json({ status: "success", message: "Diary entry deleted successfully", warning });
   } catch (error) {
-    console.error("Error: ", error.message);
+    console.error("Diary entry deletion failed:", error.message);
     res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
   }
 });
 
