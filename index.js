@@ -60,7 +60,16 @@ function getDiaryImageBucket() {
     throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured on the API server");
   }
   if (!supabaseClient) {
-    supabaseClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    const projectUrl = new URL(process.env.SUPABASE_URL);
+    if (projectUrl.pathname === "/rest/v1" || projectUrl.pathname === "/rest/v1/") {
+      projectUrl.pathname = "/";
+    } else if (projectUrl.pathname !== "/") {
+      throw new Error("SUPABASE_URL must be the Supabase Project URL, not a REST endpoint or other path");
+    }
+    if (projectUrl.search || projectUrl.hash) {
+      throw new Error("SUPABASE_URL must not include a query string or fragment");
+    }
+    supabaseClient = createClient(projectUrl.origin, process.env.SUPABASE_SERVICE_ROLE_KEY);
   }
   return supabaseClient.storage.from(process.env.SUPABASE_DIARY_BUCKET || "diary-images");
 }
